@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+# save-artifact.sh — Save a skill artifact to .nanostack/<phase>/
+# Usage:
+#   save-artifact.sh <phase> <json-string>              (structured mode, recommended)
+#   save-artifact.sh --from-session <phase> <summary>   (legacy mode, prose blob)
+#
+# Structured mode is the normal-flow path. The JSON is validated
+# against the phase-specific contract in bin/lib/artifact-schemas.sh
+# before write, so downstream skills (resolve.sh, restore-context.sh,
+# sprint-journal.sh, release-readiness) can rely on named fields
+# being present.
+#
+# --from-session is retained for manual recovery and ad-hoc tooling.
+# It builds JSON from git state + a prose summary string and bypasses
+# the phase-specific validator (the prose blob would never satisfy
+# summary-as-object), so it writes a `schema_legacy: true` flag and
+# emits a deprecation warning to stderr. The core SKILL.md files
+# (plan/review/security/qa/ship) no longer document it.
+#
+# Because the validator bypass produces an artifact that downstream gates
+# still trust as "verified", --from-session is gated behind an explicit
+# opt-in (NANOSTACK_ALLOW_LEGACY_ARTIFACT=1). No normal-flow skill sets
+# it, so accidental calls fail by default; manual recovery sets it
+# deliberately. Callers able to set the environment can opt in too.
+#
+# Validates JSON has required fields before saving. Fails on invalid input.
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/lib/store-path.sh"
+source "$SCRIPT_DIR/lib/audit.sh"
+[ -f "$SCRIPT_DIR/lib/preflight.sh" ] && { source "$SCRIPT_DIR/lib/preflight.sh"; nanostack_require jq; }
+[ -f "$SCRIPT_DIR/lib/portable.sh" ] && source "$SCRIPT_DIR/lib/portable.sh"
+[ -f "$SCRIPT_DIR/lib/artifact-schemas.sh" ] && source "$SCRIPT_DIR/lib/artifact-schemas.sh"
+
+LEGACY_MODE=0
+
+# ─── Session mode: build JSON from git state + summary ──────
+if [ "${1:-}" = "--from-session" ]; then
+  PHASE="${2:?Usage: save-artifact.sh --from-session <phase> <summary>}"
+  SUMMARY_TEXT="${3:?Missing summary argument}"
+  LEGACY_MODE=1
+
+  # Gate the validator bypass behind an explicit opt-in. The resulting
+  # schema_legacy artifact is still treated as a verified upstream by
+  # resolve.sh / the phase gate, so an accidental or programmatic call
+  # could otherwise pass an unvalidated prose blob off as a completed
+  # phase. Manual recovery sets NANOSTACK_ALLOW_LEGACY_ARTIFACT=1 on
+  # purpose; no normal-flow skill does.
+  if [ "${NANOSTACK_ALLOW_LEGACY_ARTIFACT:-0}" != "1" ]; then
+    echo "save-artifact.sh: --from-session is gated. It bypasses per-phase schema" >&2
+    echo "                  validation and exists only for manual recovery. Re-run with" >&2
+    echo "                  NANOSTACK_ALLOW_LEGACY_ARTIFACT=1 if you truly need it, or use" >&2
+    echo "                  the structured form (see reference/artifact-schema.md)." >&2
+    exit 1
+  fi
+
+  echo "save-artifact.sh: --from-session is a legacy mode for manual recovery." >&2
+  echo "                  Normal-path skills must call the structured form (see reference/artifact-schema.md)." >&2
+
+  PROJECT="$(pwd)"
+  BRANCH=$(git branch --show-current 2>/dev/null || echo "unknown")
+
+  # Build context checkpoint from git state
+  CHANGED_FILES=$(git diff --name-only HEAD 2>/dev/null | head -20 | jq -R . | jq -s . 2>/dev/null || echo "[]")
+  STAGED_FILES=$(git diff --cached --name-only 2>/dev/null | head -20 | jq -R . | jq -s . 2>/dev/null || echo "[]")
+  RECENT_COMMITS=$(git log --oneline -5 2>/dev/null | jq -R . | jq -s . 2>/dev/null || echo "[]")
+
+  JSON=$(jq -n \
+    --arg phase "$PHASE" \
+    --arg summary "$SUMMARY_TEXT" \
+    --arg project "$PROJECT" \
+    --arg branch "$BRANCH" \
+    --argjson changed "$CHANGED_FILES" \
+    --argjson staged "$STAGED_FILES" \
+    --argjson commits "$RECENT_COMMITS" \
+    '{
+      phase: $phase,
+      summary: $summary,
+      schema_legacy: true,
+      context_checkpoint: {
+        summary: $summary,
+        key_files: ($changed + $staged | unique),
+        recent_commits: $commits,
+        decisions_made: [],
+        open_questions: []
+      }
+    }')
+
+  # Run the standard save logic below
+  shift 3 || true
+  set -- "$PHASE" "$JSON"
+fi
+
+PHASE="${1:?Usage: save-artifact.sh <phase> <json>}"
+JSON="${2:?Missing JSON argument}"
+STORE="$NANOSTACK_STORE/$PHASE"
+
+# Phase registry is the single source of truth for which phases exist.
+# Core phases are always valid; custom phases come from
+# .nanostack/config.json (.custom_phases).
+. "$SCRIPT_DIR/lib/phases.sh"
+if ! nano_phase_exists "$PHASE"; then
+  echo "error: invalid phase '$PHASE'. Must be one of: $(nano_all_phases)" >&2
+  exit 1
+fi
+
+# Validate JSON is parseable
+if ! echo "$JSON" | jq '.' >/dev/null 2>&1; then
+  echo "error: invalid JSON input" >&2
+  exit 1
+fi
+
+# Validate required fields
+MISSING=""
+if ! echo "$JSON" | jq -e '.phase' >/dev/null 2>&1; then
+  MISSING="phase"
+fi
+if ! echo "$JSON" | jq -e '.summary' >/dev/null 2>&1; then
+  MISSING="${MISSING:+$MISSING, }summary"
+fi
+if [ -n "$MISSING" ]; then
+  echo "error: artifact missing required fields: $MISSING" >&2
+  exit 1
+fi
+
+# Validate phase field matches argument
+ARTIFACT_PHASE=$(echo "$JSON" | jq -r '.phase')
+if [ "$ARTIFACT_PHASE" != "$PHASE" ]; then
+  echo "error: phase argument '$PHASE' does not match artifact phase '$ARTIFACT_PHASE'" >&2
+  exit 1
+fi
+
+# Phase-specific schema check (PR 3 of the 2026-05-10 architecture
+# audit). Structured artifacts must include phase-required fields
+# (summary as object, context_checkpoint, findings/scope_drift where
+# applicable). --from-session legacy mode skips this because the
+# prose-blob form cannot satisfy summary-as-object; those artifacts
+# carry schema_legacy: true so downstream consumers can distinguish.
+if [ "$LEGACY_MODE" = "0" ] && declare -F nano_validate_artifact >/dev/null 2>&1; then
+  if ! nano_validate_artifact "$PHASE" "$JSON"; then
+    exit 1
+  fi
+fi
+
+mkdir -p "$STORE"
+
+TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+FILENAME="$STORE/$(date -u +"%Y%m%d-%H%M%S").json"
+
+# ── Secret scanning: redact credentials before persisting ──
+# Patterns: Stripe, Anthropic, AWS, GitHub, Slack, OpenAI
+SECRET_PATTERNS='sk_live_[a-zA-Z0-9]{20,}|sk_test_[a-zA-Z0-9]{20,}|sk-ant-[a-zA-Z0-9]{20,}|AKIA[0-9A-Z]{16}|ghp_[a-zA-Z0-9]{36}|gho_[a-zA-Z0-9]{36}|xoxb-[0-9a-zA-Z-]{20,}|xoxp-[0-9a-zA-Z-]{20,}|sk-[a-zA-Z0-9]{48,}'
+SECRETS_FOUND=$(echo "$JSON" | grep -oiE "$SECRET_PATTERNS" 2>/dev/null | sort -u)
+if [ -n "$SECRETS_FOUND" ]; then
+  echo "warning: artifact contains potential secrets — redacting before save" >&2
+  while IFS= read -r secret; do
+    [ -z "$secret" ] && continue
+    PREFIX=$(echo "$secret" | cut -c1-8)
+    JSON=$(echo "$JSON" | sed "s|$secret|${PREFIX}***REDACTED***|g")
+  done <<< "$SECRETS_FOUND"
+fi
+
+# ── Truncate findings if too many ──
+MAX_FINDINGS="${NANOSTACK_MAX_FINDINGS:-50}"
+FINDING_COUNT=$(echo "$JSON" | jq '.findings | length' 2>/dev/null || echo 0)
+if [ "$FINDING_COUNT" -gt "$MAX_FINDINGS" ]; then
+  echo "warning: truncating findings from $FINDING_COUNT to $MAX_FINDINGS" >&2
+  JSON=$(echo "$JSON" | jq --argjson max "$MAX_FINDINGS" --argjson total "$FINDING_COUNT" \
+    '.findings = (.findings[:$max] + [{"id":"TRUNCATED","severity":"info","description":"\($total) total findings. Showing first \($max)."}]) | .truncated = true')
+fi
+
+# Inject timestamp and project path if not present
+ENRICHED=$(echo "$JSON" | jq \
+  --arg ts "$TIMESTAMP" \
+  --arg proj "$(pwd)" \
+  --arg branch "$(git branch --show-current 2>/dev/null || echo 'unknown')" \
+  '. + {timestamp: ($ts), project: ($proj), branch: ($branch)}')
+
+# ── Integrity checksum (portable: nano_sha256 or shasum fallback) ──
+if declare -F nano_sha256 >/dev/null 2>&1; then
+  CHECKSUM=$(echo "$ENRICHED" | jq -Sc '.' | nano_sha256 | cut -d' ' -f1)
+else
+  CHECKSUM=$(echo "$ENRICHED" | jq -Sc '.' | shasum -a 256 | cut -d' ' -f1)
+fi
+ENRICHED=$(echo "$ENRICHED" | jq --arg cs "$CHECKSUM" '. + {integrity: $cs}')
+
+echo "$ENRICHED" | jq '.' > "$FILENAME"
+audit_log "artifact_saved" "$PHASE" "$(basename "$FILENAME")"
+echo "$FILENAME"
+
+# ─── Auto-complete phase in session ──────────────────────────
+# Always update session when an active session exists, regardless of save mode.
+SESSION_SH="$SCRIPT_DIR/session.sh"
+if [ -x "$SESSION_SH" ] && [ -f "$NANOSTACK_STORE/session.json" ]; then
+  "$SESSION_SH" phase-start "$PHASE" >/dev/null 2>&1 || true
+  "$SESSION_SH" phase-complete "$PHASE" >/dev/null 2>&1 || true
+fi

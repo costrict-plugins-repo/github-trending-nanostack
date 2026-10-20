@@ -1,0 +1,2 @@
+@./SKILL.md
+@./ZEN.md

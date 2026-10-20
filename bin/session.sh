@@ -1,0 +1,679 @@
+#!/usr/bin/env bash
+# session.sh — Session lifecycle management for crash recovery and resume
+# Usage:
+#   session.sh init <type> [--issue <url>]   Create session.json for current project
+#   session.sh phase-start <phase>           Mark phase as in_progress
+#   session.sh phase-complete <phase>        Mark phase as completed
+#   session.sh resume                        Check for existing session, output resume info
+#   session.sh status                        Output current session state
+#   session.sh archive                       Archive current session
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+NANOSTACK_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+source "$SCRIPT_DIR/lib/store-path.sh"
+source "$SCRIPT_DIR/lib/audit.sh"
+source "$SCRIPT_DIR/lib/session-lock.sh"
+[ -f "$SCRIPT_DIR/lib/preflight.sh" ] && { source "$SCRIPT_DIR/lib/preflight.sh"; nanostack_require jq; }
+[ -f "$SCRIPT_DIR/lib/phases.sh" ] && . "$SCRIPT_DIR/lib/phases.sh"
+
+SESSION_FILE="$NANOSTACK_STORE/session.json"
+PROJECT="$(pwd)"
+PROJECT_NAME=$(basename "$PROJECT")
+NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+# Reduce a session_id read from session.json to a safe filename segment.
+# session.json is mutable local state; a poisoned session_id like
+# "../../tmp/evil" would otherwise redirect the archive mv/write outside the
+# sessions directory. Strip any path components and keep only filename-safe
+# characters; fall back to "unknown" if nothing safe remains.
+nano_safe_id() {
+  local id="${1##*/}"
+  id=$(printf '%s' "$id" | tr -cd 'A-Za-z0-9._-')
+  case "$id" in ''|.|..) id="unknown" ;; esac
+  printf '%s' "$id"
+}
+
+# ─── host + capability detection ────────────────────────────
+# Used by cmd_init to snapshot what the running host can actually
+# enforce. Resolution order: explicit flag > NANOSTACK_HOST env >
+# script path > first detected CLI > "unknown".
+detect_host() {
+  if [ -n "${NANOSTACK_HOST:-}" ]; then
+    echo "$NANOSTACK_HOST"; return
+  fi
+  case "$SCRIPT_DIR" in
+    */.claude/*)       echo "claude"; return ;;
+    */.cursor/*)       echo "cursor"; return ;;
+    */.codex/*)        echo "codex"; return ;;
+    */opencode/*)      echo "opencode"; return ;;
+    */.gemini/*)       echo "gemini"; return ;;
+  esac
+  for h in claude codex cursor opencode gemini; do
+    if command -v "$h" >/dev/null 2>&1; then echo "$h"; return; fi
+  done
+  echo "unknown"
+}
+
+# Read host adapter capabilities into a JSON object suitable for
+# the session.capabilities field. If the adapter is missing or
+# unreadable, fall back to instructions_only (the conservative
+# default that never overstates what the host actually does).
+read_capabilities() {
+  local host="$1"
+  local adapter="$NANOSTACK_ROOT/adapters/${host}.json"
+  if [ -f "$adapter" ]; then
+    jq '{
+      skill_discovery: (.skill_discovery // "instructions_only"),
+      bash_guard:      (.bash_guard      // "instructions_only"),
+      write_guard:     (.write_guard     // "instructions_only"),
+      phase_gate:      (.phase_gate      // "instructions_only"),
+      verification_method: (.verification.method // "unknown"),
+      last_verified:   (.last_verified   // null)
+    }' "$adapter"
+  else
+    jq -n '{
+      skill_discovery: "instructions_only",
+      bash_guard:      "instructions_only",
+      write_guard:     "instructions_only",
+      phase_gate:      "instructions_only",
+      verification_method: "unknown",
+      last_verified: null
+    }'
+  fi
+}
+
+# Resolve the v1.0 profile per the spec rules:
+#   1. explicit --profile flag (if non-empty)
+#   2. .nanostack/config.json preferences.profile
+#   3. no git repo -> guided
+#   4. all guards instructions_only -> guided
+#   5. else professional
+resolve_profile() {
+  local explicit="$1"
+  local caps_json="$2"
+  if [ -n "$explicit" ]; then echo "$explicit"; return; fi
+  if [ -f .nanostack/config.json ]; then
+    local cfg
+    cfg=$(jq -r '.preferences.profile // empty' .nanostack/config.json 2>/dev/null)
+    if [ -n "$cfg" ]; then echo "$cfg"; return; fi
+  fi
+  if ! git rev-parse --git-dir >/dev/null 2>&1; then
+    echo "guided"; return
+  fi
+  local bash_g write_g phase_g
+  bash_g=$(echo "$caps_json"  | jq -r '.bash_guard')
+  write_g=$(echo "$caps_json" | jq -r '.write_guard')
+  phase_g=$(echo "$caps_json" | jq -r '.phase_gate')
+  if [ "$bash_g" = "instructions_only" ] && [ "$write_g" = "instructions_only" ] && [ "$phase_g" = "instructions_only" ]; then
+    echo "guided"
+  else
+    echo "professional"
+  fi
+}
+
+# Default policy values per profile. Guided defaults must never
+# be `allow` (spec). User config can override per-key but cannot
+# downgrade Guided to allow.
+default_policy_json() {
+  local profile="$1"
+  case "$profile" in
+    guided)
+      jq -n '{outside_project_write:"block", env_read:"block", plain_language:true}'
+      ;;
+    *)
+      jq -n '{outside_project_write:"warn",  env_read:"warn",  plain_language:false}'
+      ;;
+  esac
+}
+
+# ─── init ───────────────────────────────────────────────────
+cmd_init() {
+  local type="${1:-development}"
+  local issue_url=""
+  local autopilot="false"
+  local goal=""
+  local profile_flag=""
+  local run_mode="normal"
+  local plan_approval=""
+  local host_flag=""
+
+  shift || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --issue)         issue_url="$2"; shift 2 ;;
+      --autopilot)     autopilot="true"; shift ;;
+      --goal)          goal="$2"; shift 2 ;;
+      --profile)       profile_flag="$2"; shift 2 ;;
+      --run-mode)      run_mode="$2"; shift 2 ;;
+      --plan-approval) plan_approval="$2"; shift 2 ;;
+      --host)          host_flag="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+
+  # Validate enumerated flag values up-front. The session is the
+  # workflow source of truth, so silently accepting a typo would
+  # poison every downstream skill that reads from it.
+  case "$profile_flag" in
+    ""|guided|professional) ;;
+    *) echo "ERROR: --profile must be guided or professional, got: $profile_flag" >&2; exit 1 ;;
+  esac
+  case "$run_mode" in
+    normal|report_only) ;;
+    *) echo "ERROR: --run-mode must be normal or report_only, got: $run_mode" >&2; exit 1 ;;
+  esac
+  case "$plan_approval" in
+    ""|manual|auto|not_required) ;;
+    *) echo "ERROR: --plan-approval must be manual, auto, or not_required, got: $plan_approval" >&2; exit 1 ;;
+  esac
+
+  # Implications declared in the spec:
+  #   --autopilot        => plan_approval=auto (unless caller set explicitly)
+  #   --run-mode report_only => plan_approval=not_required (always)
+  if [ "$autopilot" = "true" ] && [ -z "$plan_approval" ]; then
+    plan_approval="auto"
+  fi
+  if [ "$run_mode" = "report_only" ]; then
+    plan_approval="not_required"
+  fi
+  [ -z "$plan_approval" ] && plan_approval="manual"
+
+  # Lock across archive-existing + new-session write so a concurrent
+  # writer cannot land an update on the old session between our snapshot
+  # and its replacement, and cannot race two inits into one file.
+  nano_session_lock "$SESSION_FILE"
+
+  # Archive existing session if present
+  if [ -f "$SESSION_FILE" ]; then
+    local old_id
+    old_id=$(jq -r '.session_id // "unknown"' "$SESSION_FILE")
+    old_id=$(nano_safe_id "$old_id")
+    local archive_dir="$NANOSTACK_STORE/sessions"
+    mkdir -p "$archive_dir"
+    mv "$SESSION_FILE" "$archive_dir/${old_id}.json"
+  fi
+
+  local session_id="${PROJECT_NAME}-$(date -u +%Y%m%d-%H%M%S)"
+  local repo=""
+  repo=$(git remote get-url origin 2>/dev/null | sed 's|.*github.com[:/]||; s|\.git$||') || true
+
+  local host
+  host="${host_flag:-$(detect_host)}"
+
+  local capabilities_json
+  capabilities_json=$(read_capabilities "$host")
+
+  local profile
+  profile=$(resolve_profile "$profile_flag" "$capabilities_json")
+
+  local policy_json
+  policy_json=$(default_policy_json "$profile")
+  # Merge user overrides from .nanostack/config.json. Allowed values
+  # are allow|warn|confirm|block; Guided refuses to downgrade to
+  # allow per spec (silent allow is forbidden).
+  if [ -f .nanostack/config.json ]; then
+    local user_policy
+    user_policy=$(jq -r '.preferences.policies // {} | tojson' .nanostack/config.json 2>/dev/null)
+    if [ -n "$user_policy" ] && [ "$user_policy" != "null" ] && [ "$user_policy" != "{}" ]; then
+      policy_json=$(echo "$policy_json" | jq --argjson u "$user_policy" --arg profile "$profile" '
+        . as $base
+        | reduce ($u | to_entries[]) as $e ($base;
+            if ($e.value == "allow" and $profile == "guided") then .
+            else .[$e.key] = $e.value
+            end)
+      ')
+    fi
+  fi
+
+  # Snapshot the active phase_graph at session creation. Custom
+  # workflow stacks read this back during phase-complete so the
+  # graph cannot drift mid-sprint (e.g. user edits config.json after
+  # /think runs). Falls back to an empty array when the helper is
+  # unavailable; cmd_phase_complete handles that by skipping the
+  # graph-aware path.
+  local phase_graph_json="[]"
+  local initial_ready_json="[]"
+  local initial_phase_log_json="[]"
+  # /feature sessions skip /think by contract (feature/SKILL.md goes
+  # straight to /plan). Pre-seed think as completed in the phase_log
+  # so the graph-aware lifecycle does not advertise it as ready after
+  # /plan completes. Codex caught the regression on the PR 4 eleventh
+  # review pass: after a /feature plan ran, next-step.sh reported
+  # next_phase = think.
+  if [ "$type" = "feature" ]; then
+    initial_phase_log_json=$(jq -nc --arg date "$NOW" \
+      '[{phase:"think", status:"completed", started_at:$date, started_epoch:0, completed_at:$date, duration_seconds:0, artifact:null, source:"feature-skip"}]')
+  fi
+  if declare -F nano_phase_graph_json >/dev/null 2>&1; then
+    phase_graph_json=$(nano_phase_graph_json 2>/dev/null || echo "[]")
+    # Compute the initial ready set so a caller that asks for
+    # next_phase BEFORE the first phase-complete sees the actual root
+    # of the graph (e.g. think for the default sprint) rather than an
+    # empty array. Without this, bin/next-step.sh used to fall back to
+    # "ship" for a freshly-initialized session, which Codex caught
+    # on the PR 4 first review pass. /feature pre-seeds think above
+    # so its initial ready set starts from plan onward.
+    if declare -F nano_phase_ready_from_graph >/dev/null 2>&1 && [ "$phase_graph_json" != "[]" ]; then
+      local completed_seed_init
+      completed_seed_init=$(echo "$initial_phase_log_json" | jq -c '[.[] | select(.status == "completed") | .phase]')
+      local initial_ready
+      initial_ready=$(nano_phase_ready_from_graph "$phase_graph_json" "$completed_seed_init" "[]" 2>/dev/null || true)
+      if [ -n "$initial_ready" ]; then
+        initial_ready_json=$(echo "$initial_ready" | jq -R . | jq -sc 'map(select(length > 0))')
+      fi
+    fi
+  fi
+  local initial_next_phase="null"
+  if [ "$initial_ready_json" != "[]" ]; then
+    initial_next_phase=$(echo "$initial_ready_json" | jq -r '.[0] // "null"')
+    initial_next_phase="\"$initial_next_phase\""
+  fi
+
+  jq -n \
+    --arg id "$session_id" \
+    --arg type "$type" \
+    --arg issue "$issue_url" \
+    --arg goal "$goal" \
+    --arg repo "$repo" \
+    --arg workspace "$PROJECT" \
+    --arg date "$NOW" \
+    --arg host "$host" \
+    --arg profile "$profile" \
+    --arg run_mode "$run_mode" \
+    --arg plan_approval "$plan_approval" \
+    --argjson autopilot "$autopilot" \
+    --argjson capabilities "$capabilities_json" \
+    --argjson policy "$policy_json" \
+    --argjson phase_graph "$phase_graph_json" \
+    --argjson initial_ready "$initial_ready_json" \
+    --argjson initial_next "$initial_next_phase" \
+    --argjson initial_phase_log "$initial_phase_log_json" \
+    '{
+      schema_version: "2",
+      session_id: $id,
+      type: $type,
+      issue_url: (if $issue != "" then $issue else null end),
+      goal: (if $goal != "" then $goal else null end),
+      repo: (if $repo != "" then $repo else null end),
+      workspace: $workspace,
+      host: $host,
+      profile: $profile,
+      run_mode: $run_mode,
+      autopilot: $autopilot,
+      plan_approval: $plan_approval,
+      capabilities: $capabilities,
+      policy: $policy,
+      current_phase: null,
+      next_phase: $initial_next,
+      ready_phases: $initial_ready,
+      phase_graph: $phase_graph,
+      stop_conditions_met: [],
+      phase_log: $initial_phase_log,
+      evidence: {review:null, security:null, qa:null, ship:null},
+      budget: {
+        max_usd: null,
+        spent_usd: 0,
+        tokens_input: 0,
+        tokens_output: 0
+      },
+      started_at: $date,
+      last_updated: $date
+    }' > "$SESSION_FILE"
+
+  nano_session_unlock
+
+  audit_log "session_init" "$session_id" "$type"
+
+  # Snapshot git state for loop guard
+  "$SCRIPT_DIR/loop-guard.sh" snapshot 2>/dev/null || true
+
+  echo "$SESSION_FILE"
+}
+
+# ─── phase-start ────────────────────────────────────────────
+# Holds the shared session lock (see lib/session-lock.sh) across the
+# read-modify-write so concurrent agents (e.g., /conductor) cannot
+# double-register the same phase or interleave writes to session.json.
+cmd_phase_start() {
+  local phase="${1:?Usage: session.sh phase-start <phase>}"
+
+  if [ ! -f "$SESSION_FILE" ]; then
+    echo "ERROR: no active session. Run 'session.sh init' first." >&2
+    exit 1
+  fi
+
+  nano_session_lock "$SESSION_FILE"
+
+  # Re-check inside the lock (idempotent under concurrency)
+  local existing
+  existing=$(jq -r --arg p "$phase" \
+    '[.phase_log[] | select(.phase == $p and (.status == "completed" or .status == "in_progress"))] | length' \
+    "$SESSION_FILE" 2>/dev/null || echo "0")
+  if [ "$existing" -gt 0 ]; then
+    nano_session_unlock
+    echo "OK: $phase already in log"
+    return 0
+  fi
+
+  local epoch
+  epoch=$(date +%s)
+
+  jq \
+    --arg phase "$phase" \
+    --arg date "$NOW" \
+    --argjson epoch "$epoch" \
+    '.current_phase = $phase |
+     .phase_log += [{
+       phase: $phase,
+       status: "in_progress",
+       started_at: $date,
+       started_epoch: $epoch,
+       completed_at: null,
+       artifact: null
+     }] |
+     .last_updated = $date' "$SESSION_FILE" > "${SESSION_FILE}.tmp"
+  mv "${SESSION_FILE}.tmp" "$SESSION_FILE"
+
+  # Recompute ready_phases and next_phase so they exclude the phase
+  # we just moved to in_progress. Without this, a custom graph with
+  # multiple ready phases would keep advertising the active one and
+  # downstream schedulers could start it twice. Codex caught the
+  # stale-cache bug on the PR 4 third review pass.
+  if declare -F nano_phase_ready_from_graph >/dev/null 2>&1; then
+    local graph completed_now in_progress_now ready_list ready_json next_phase_value
+    graph=$(jq -c '.phase_graph // empty' "$SESSION_FILE" 2>/dev/null || echo "")
+    if [ -z "$graph" ] || [ "$graph" = "null" ] || [ "$graph" = "[]" ]; then
+      if declare -F nano_phase_graph_json >/dev/null 2>&1; then
+        graph=$(nano_phase_graph_json 2>/dev/null || echo "")
+      fi
+    fi
+    if [ -n "$graph" ] && [ "$graph" != "null" ] && [ "$graph" != "[]" ]; then
+      completed_now=$(jq -c '[(.phase_log // [])[] | select(.status == "completed") | .phase] | unique' "$SESSION_FILE" 2>/dev/null || echo "[]")
+      in_progress_now=$(jq -c '[(.phase_log // [])[] | select(.status == "in_progress") | .phase] | unique' "$SESSION_FILE" 2>/dev/null || echo "[]")
+      ready_list=$(nano_phase_ready_from_graph "$graph" "$completed_now" "$in_progress_now" 2>/dev/null || true)
+      ready_json="[]"
+      next_phase_value="null"
+      if [ -n "$ready_list" ]; then
+        ready_json=$(echo "$ready_list" | jq -R . | jq -sc 'map(select(length > 0))')
+        next_phase_value=$(echo "$ready_json" | jq -c '.[0] // "null"')
+      fi
+      jq --argjson ready "$ready_json" --argjson next "$next_phase_value" \
+        '.ready_phases = $ready | .next_phase = (if ($next | type) == "string" then $next else null end)' \
+        "$SESSION_FILE" > "${SESSION_FILE}.tmp"
+      mv "${SESSION_FILE}.tmp" "$SESSION_FILE"
+    fi
+  fi
+
+  nano_session_unlock
+
+  audit_log "phase_start" "$phase"
+  echo "OK: $phase started"
+}
+
+# ─── phase-complete ─────────────────────────────────────────
+cmd_phase_complete() {
+  local phase="${1:?Usage: session.sh phase-complete <phase>}"
+  local artifact=""
+
+  # Find the artifact for this phase
+  artifact=$("$SCRIPT_DIR/find-artifact.sh" "$phase" 1 2>/dev/null) || true
+
+  if [ ! -f "$SESSION_FILE" ]; then
+    echo "ERROR: no active session." >&2
+    exit 1
+  fi
+
+  # Hold the lock across the whole read-modify-write: the ready/next
+  # computation below reads session.json and the jq mutation rewrites it,
+  # so a concurrent phase-start/complete must not interleave between them.
+  nano_session_lock "$SESSION_FILE"
+
+  # ─── next phase via phase_graph ───────────────────────────
+  # PR 4 of the 2026-05-10 architecture audit: next-phase logic now
+  # consumes the active phase_graph (default sprint OR the project's
+  # custom graph from .nanostack/config.json). nano_phase_ready_from_graph
+  # returns every phase whose deps are met and which has not yet been
+  # completed or started; next_phase is the first such phase and
+  # ready_phases captures the full list so next-step.sh can surface
+  # parallel options. The previous hardcoded case statement only knew
+  # about think/plan/build/review/security/qa/ship/compound and left
+  # custom workflow stacks with next_phase=null forever.
+  local next="" ready_json="[]"
+  local completed_now
+  # Add the phase we just completed in case the JSON write below has
+  # not landed yet (this function runs immediately after the in-flight
+  # jq mutation), then dedup. Also include any prior completed phases.
+  completed_now=$(jq -c --arg p "$phase" \
+    '[(.phase_log // [])[] | select(.status == "completed") | .phase] + [$p] | unique' \
+    "$SESSION_FILE" 2>/dev/null || echo "[]")
+  local in_progress_now
+  in_progress_now=$(jq -c --arg p "$phase" \
+    '[(.phase_log // [])[] | select(.status == "in_progress" and .phase != $p) | .phase] | unique' \
+    "$SESSION_FILE" 2>/dev/null || echo "[]")
+
+  if declare -F nano_phase_ready_from_graph >/dev/null 2>&1; then
+    # Prefer the graph snapshot inside session.json (set at init time)
+    # so a mid-sprint edit to .nanostack/config.json cannot change the
+    # path under the session. Fall back to nano_phase_graph_json (which
+    # rereads config) only when the session has no snapshot.
+    local graph
+    graph=$(jq -c '.phase_graph // empty' "$SESSION_FILE" 2>/dev/null || echo "")
+    if [ -z "$graph" ] || [ "$graph" = "null" ] || [ "$graph" = "[]" ]; then
+      if declare -F nano_phase_graph_json >/dev/null 2>&1; then
+        graph=$(nano_phase_graph_json 2>/dev/null || echo "")
+      fi
+    fi
+    if [ -n "$graph" ] && [ "$graph" != "null" ] && [ "$graph" != "[]" ]; then
+      local ready_list
+      ready_list=$(nano_phase_ready_from_graph "$graph" "$completed_now" "$in_progress_now" 2>/dev/null || true)
+      if [ -n "$ready_list" ]; then
+        next=$(echo "$ready_list" | head -1)
+        ready_json=$(echo "$ready_list" | jq -R . | jq -sc 'map(select(length > 0))')
+      fi
+    fi
+  fi
+
+  # Compound is intentionally not in the canonical phase_graph (it is
+  # a post-sprint reflection skill). Preserve the historical post-ship
+  # hint so the existing user prompts and tests continue to advance.
+  if [ -z "$next" ] && [ "$phase" = "ship" ]; then
+    next="compound"
+    ready_json='["compound"]'
+  fi
+
+  # Calculate duration from stored epoch. save-artifact.sh auto-calls
+  # phase-complete after writing the artifact, so this function must be
+  # idempotent: if no in_progress entry remains, the jq filter returns
+  # an empty string and the integer comparison would fail. Default to
+  # 0 so a second phase-complete is a clean no-op for duration.
+  local duration=0
+  local start_epoch
+  start_epoch=$(jq -r --arg phase "$phase" \
+    '.phase_log[] | select(.phase == $phase and .status == "in_progress") | .started_epoch // 0' "$SESSION_FILE" 2>/dev/null)
+  if [ "${start_epoch:-0}" -gt 0 ] 2>/dev/null; then
+    local end_epoch
+    end_epoch=$(date +%s)
+    duration=$((end_epoch - start_epoch))
+  fi
+
+  jq \
+    --arg phase "$phase" \
+    --arg date "$NOW" \
+    --arg artifact "$artifact" \
+    --arg next "$next" \
+    --argjson ready "$ready_json" \
+    --argjson duration "$duration" \
+    '(.phase_log[] | select(.phase == $phase and .status == "in_progress")) |=
+       (.status = "completed" | .completed_at = $date | .duration_seconds = $duration | .artifact = (if $artifact != "" then $artifact else null end)) |
+     .current_phase = ([.phase_log[] | select(.status == "in_progress") | .phase] | last // null) |
+     .next_phase = (if $next != "" then $next else null end) |
+     .ready_phases = $ready |
+     .last_updated = $date' "$SESSION_FILE" > "${SESSION_FILE}.tmp"
+  mv "${SESSION_FILE}.tmp" "$SESSION_FILE"
+
+  nano_session_unlock
+
+  audit_log "phase_complete" "$phase" "${duration}s"
+
+  # Loop guard: check for stalled autopilot (no git changes between phases)
+  LOOP_WARN=$("$SCRIPT_DIR/loop-guard.sh" check 2>/dev/null || true)
+  if [ -n "$LOOP_WARN" ]; then
+    echo "$LOOP_WARN"
+  fi
+
+  echo "OK: $phase completed"
+}
+
+# Compatibility layer for v1 sessions. When schema_version is missing
+# or "1", derive v2 fields from what is available: profile from local
+# git presence, plan_approval from autopilot, etc. Readers must never
+# fail on a v1 session.
+v2_compat_filter() {
+  cat <<'JQ'
+. as $s
+| ($s.schema_version // "1") as $sv
+| ($s.autopilot // false) as $autopilot
+| ($s.profile // "") as $explicit_profile
+| ($s.workspace // "") as $ws
+| (if $explicit_profile != "" then $explicit_profile
+   else (if ($s.capabilities // null) == null then "guided" else "professional" end)
+  end) as $profile
+| (if ($s.plan_approval // "") != "" then $s.plan_approval
+   elif $autopilot then "auto"
+   else "manual" end) as $plan_approval
+| (if ($s.run_mode // "") != "" then $s.run_mode else "normal" end) as $run_mode
+| (if ($s.host // "") != "" then $s.host else "unknown" end) as $host
+| (if ($s.capabilities // null) != null then $s.capabilities
+   else {
+     skill_discovery: "instructions_only",
+     bash_guard: "instructions_only",
+     write_guard: "instructions_only",
+     phase_gate: "instructions_only",
+     verification_method: "unknown",
+     last_verified: null
+   } end) as $caps
+| (if ($s.policy // null) != null then $s.policy
+   else (if $profile == "guided"
+         then {outside_project_write:"block", env_read:"block", plain_language:true}
+         else {outside_project_write:"warn",  env_read:"warn",  plain_language:false} end)
+   end) as $policy
+| $s + {
+    schema_version: $sv,
+    profile: $profile,
+    run_mode: $run_mode,
+    autopilot: $autopilot,
+    plan_approval: $plan_approval,
+    host: $host,
+    capabilities: $caps,
+    policy: $policy
+  }
+JQ
+}
+
+# ─── resume ─────────────────────────────────────────────────
+cmd_resume() {
+  if [ ! -f "$SESSION_FILE" ]; then
+    echo '{"resumable":false,"reason":"no_session"}'
+    exit 0
+  fi
+
+  # Check if session belongs to this project
+  local workspace
+  workspace=$(jq -r '.workspace' "$SESSION_FILE")
+  if [ "$workspace" != "$PROJECT" ]; then
+    echo '{"resumable":false,"reason":"different_project"}'
+    exit 0
+  fi
+
+  jq "$(v2_compat_filter)"' | {
+    resumable: true,
+    session_id: .session_id,
+    type: .type,
+    schema_version: .schema_version,
+    profile: .profile,
+    run_mode: .run_mode,
+    autopilot: .autopilot,
+    plan_approval: .plan_approval,
+    host: .host,
+    capabilities: .capabilities,
+    policy: .policy,
+    current_phase: (.current_phase // "none"),
+    next_phase: (.next_phase // "none"),
+    last_phase: (.phase_log[-1].phase // "none"),
+    last_status: (.phase_log[-1].status // "none"),
+    completed_phases: ([.phase_log[] | select(.status == "completed") | .phase] | join(", ")),
+    action: (if (.phase_log[-1].status // "") == "in_progress" then "restart_phase" else "next_phase" end)
+  }' "$SESSION_FILE"
+}
+
+# ─── status ─────────────────────────────────────────────────
+cmd_status() {
+  if [ ! -f "$SESSION_FILE" ]; then
+    echo '{"active":false}'
+    exit 0
+  fi
+
+  jq "$(v2_compat_filter)"' | {
+    active: true,
+    session_id: .session_id,
+    type: .type,
+    schema_version: .schema_version,
+    profile: .profile,
+    run_mode: .run_mode,
+    autopilot: .autopilot,
+    plan_approval: .plan_approval,
+    host: .host,
+    capabilities: .capabilities,
+    policy: .policy,
+    current_phase: .current_phase,
+    phases_completed: [.phase_log[] | select(.status == "completed") | .phase],
+    phases_in_progress: [.phase_log[] | select(.status == "in_progress") | .phase],
+    started_at: .started_at,
+    last_updated: .last_updated,
+    budget: .budget
+  }' "$SESSION_FILE"
+}
+
+# ─── archive ────────────────────────────────────────────────
+cmd_archive() {
+  if [ ! -f "$SESSION_FILE" ]; then
+    echo "No active session to archive."
+    exit 0
+  fi
+
+  # Lock across read + archive write + removal so a concurrent writer
+  # cannot mutate session.json after we snapshot it but before we remove
+  # it (which would silently discard that update).
+  nano_session_lock "$SESSION_FILE"
+
+  local session_id
+  session_id=$(jq -r '.session_id' "$SESSION_FILE")
+  session_id=$(nano_safe_id "$session_id")
+  local archive_dir="$NANOSTACK_STORE/sessions"
+  mkdir -p "$archive_dir"
+
+  jq --arg date "$NOW" '.status = "archived" | .archived_at = $date' "$SESSION_FILE" > "$archive_dir/${session_id}.json"
+  rm "$SESSION_FILE"
+
+  nano_session_unlock
+
+  echo "OK: archived $session_id"
+}
+
+# ─── dispatch ───────────────────────────────────────────────
+CMD="${1:-status}"
+shift || true
+
+case "$CMD" in
+  init)           cmd_init "$@" ;;
+  phase-start)    cmd_phase_start "$@" ;;
+  phase-complete) cmd_phase_complete "$@" ;;
+  resume)         cmd_resume "$@" ;;
+  status)         cmd_status "$@" ;;
+  archive)        cmd_archive "$@" ;;
+  *)
+    echo "Usage: session.sh <init|phase-start|phase-complete|resume|status|archive>" >&2
+    exit 1
+    ;;
+esac

@@ -1,0 +1,654 @@
+#!/usr/bin/env bash
+# nanostack setup — register skills with Claude Code / Codex / Kiro
+# No build step required. No runtime dependencies.
+#
+# Install:
+#   git clone https://github.com/garagon/nanostack.git ~/.claude/skills/nanostack
+#   cd ~/.claude/skills/nanostack && ./setup
+#
+# Per-repo:
+#   git clone https://github.com/garagon/nanostack.git .claude/skills/nanostack
+#   cd .claude/skills/nanostack && ./setup
+#
+# Codex:
+#   git clone https://github.com/garagon/nanostack.git ~/nanostack
+#   cd ~/nanostack && ./setup --host codex
+set -e
+
+NANOSTACK_DIR="$(cd "$(dirname "$0")" && pwd)"
+SOURCE_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+SKILLS_DIR="$(dirname "$NANOSTACK_DIR")"
+SKILLS=(think nano review qa security ship guard conductor compound feature nano-run nano-help)
+
+# Map skill name to directory (when they differ)
+skill_dir() {
+  case "$1" in
+    nano) echo "plan" ;;
+    nano-run) echo "start" ;;
+    nano-help) echo "help" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+# Accept only skill public names that are valid command identifiers:
+# lowercase letter first, then lowercase letters, digits, or hyphens,
+# up to 40 chars total. Rejects path components (/, ..), quotes, shell
+# metacharacters, whitespace, and empty strings. Rename values are
+# persisted and later interpolated into paths and sed expressions, so
+# this check must be strict even when the source is a trusted-looking
+# setup.json (an attacker who can write that file could otherwise flow
+# user input into a path delete or a sed command).
+is_valid_skill_name() {
+  local name="$1"
+  [ -n "$name" ] || return 1
+  printf '%s' "$name" | LC_ALL=C grep -qE '^[a-z][a-z0-9-]{0,39}$'
+}
+
+# Walk the current RENAMES string (comma-separated old=new pairs) and
+# make sure every pair is safe. Rejects the whole input on the first
+# violation so partial application cannot happen. Writes a single line
+# to stderr naming the offending pair.
+validate_renames() {
+  local source="${1:-cli}"
+  [ -z "$RENAMES" ] && return 0
+  local pair old new
+  # Split on commas without touching existing whitespace semantics.
+  local OIFS="$IFS"
+  IFS=','
+  # shellcheck disable=SC2086
+  set -f
+  for pair in $RENAMES; do
+    set +f
+    IFS="$OIFS"
+    # Trim surrounding whitespace only.
+    pair="${pair# }"; pair="${pair% }"
+    [ -z "$pair" ] && continue
+    case "$pair" in
+      *=*) ;;
+      *)
+        echo "ERROR: invalid rename entry '$pair' (expected old=new) from $source" >&2
+        exit 1 ;;
+    esac
+    old="${pair%%=*}"
+    new="${pair#*=}"
+    if ! is_valid_skill_name "$old"; then
+      echo "ERROR: invalid source skill name '$old' from $source (allowed: [a-z][a-z0-9-]{0,39})" >&2
+      exit 1
+    fi
+    if ! is_valid_skill_name "$new"; then
+      echo "ERROR: invalid rename target '$new' from $source (allowed: [a-z][a-z0-9-]{0,39})" >&2
+      exit 1
+    fi
+    IFS=','
+  done
+  set +f
+  IFS="$OIFS"
+}
+
+# sed -i portability (BSD vs GNU)
+if sed --version >/dev/null 2>&1; then
+  sed_inplace() { sed -i "$@"; }
+else
+  sed_inplace() { sed -i '' "$@"; }
+fi
+
+# ─── Parse flags ──────────────────────────────────────────────
+HOST="claude"
+LOCAL_INSTALL=0
+RENAMES=""
+VERBOSE=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --host)  [ -z "${2:-}" ] && echo "Missing value for --host" >&2 && exit 1; HOST="$2"; shift 2 ;;
+    --host=*) HOST="${1#--host=}"; shift ;;
+    --local) LOCAL_INSTALL=1; shift ;;
+    --rename) [ -z "${2:-}" ] && echo "Missing value for --rename" >&2 && exit 1; RENAMES="$2"; shift 2 ;;
+    --rename=*) RENAMES="${1#--rename=}"; shift ;;
+    --list) LIST_SKILLS=1; shift ;;
+    --verbose|-v) VERBOSE=1; shift ;;
+    --help)
+      cat <<'HELP'
+Usage: ./setup [OPTIONS]
+
+Options:
+  --host <agent>    Target: claude (default), codex, cursor, opencode, gemini, auto
+  --local           Install to .claude/skills/ in current working directory
+  --rename <map>    Rename skills to avoid collisions (comma-separated old=new pairs)
+  --rename reset    Restore all skills to their original names
+  --list            Show installed skills and their current names
+  --verbose, -v     Show the full skill list and workflow line after install
+  --help            Show this help
+
+Install methods:
+  # Global (recommended)
+  git clone https://github.com/garagon/nanostack.git ~/.claude/skills/nanostack
+  cd ~/.claude/skills/nanostack && ./setup
+
+  # Per-repo
+  ./setup --local
+
+  # Multi-agent
+  ./setup --host auto
+
+  # Rename skills that collide with other tools
+  ./setup --rename "review=nano-review,security=nano-security"
+
+  # See current skill names
+  ./setup --list
+
+  # Restore original names
+  ./setup --rename reset
+HELP
+      exit 0
+      ;;
+    *) shift ;;
+  esac
+done
+
+# Handle --list (show skills and exit)
+if [ "${LIST_SKILLS:-0}" -eq 1 ]; then
+  echo "Nanostack Skills"
+  echo "================"
+  # Load saved renames
+  if [ -f "$HOME/.nanostack/setup.json" ]; then
+    saved=$(jq -r '.renames // {} | to_entries[] | "\(.key)=\(.value)"' "$HOME/.nanostack/setup.json" 2>/dev/null | tr '\n' ' ')
+  fi
+  for skill in "${SKILLS[@]}"; do
+    renamed=""
+    for pair in $saved; do
+      old="${pair%%=*}"
+      new="${pair#*=}"
+      if [ "$old" = "$skill" ]; then
+        renamed="$new"
+        break
+      fi
+    done
+    if [ -n "$renamed" ]; then
+      echo "  /$renamed (original: /$skill)"
+    else
+      echo "  /$skill"
+    fi
+  done
+  echo ""
+  echo "To rename: ./setup --rename \"review=nano-review\""
+  echo "To reset:  ./setup --rename reset"
+  exit 0
+fi
+
+# Handle --rename reset
+if [ "$RENAMES" = "reset" ]; then
+  RENAMES=""
+  if [ -f "$HOME/.nanostack/setup.json" ]; then
+    jq '.renames = {}' "$HOME/.nanostack/setup.json" > "$HOME/.nanostack/setup.json.tmp" && \
+      mv "$HOME/.nanostack/setup.json.tmp" "$HOME/.nanostack/setup.json"
+  fi
+  echo "Renames cleared. Running setup with original names..."
+  echo ""
+fi
+
+case "$HOST" in
+  claude|codex|cursor|opencode|gemini|auto) ;;
+  *) echo "Unknown --host: $HOST (expected claude, codex, cursor, opencode, gemini, or auto)" >&2; exit 1 ;;
+esac
+
+# --local override
+if [ "$LOCAL_INSTALL" -eq 1 ]; then
+  SKILLS_DIR="$(pwd)/.claude/skills"
+  mkdir -p "$SKILLS_DIR"
+  NANOSTACK_LOCAL="$SKILLS_DIR/nanostack"
+  if [ ! -e "$NANOSTACK_LOCAL" ]; then
+    ln -snf "$SOURCE_DIR" "$NANOSTACK_LOCAL"
+    echo "Linked $NANOSTACK_LOCAL → $SOURCE_DIR"
+  fi
+  HOST="claude"
+fi
+
+# ─── Rename map ──────────────────────────────────────────────
+# Parse --rename "review=ns-review,security=ns-sec" into a lookup.
+# Renames persist in ~/.nanostack/setup.json so upgrade.sh reapplies them.
+# Uses a flat string "old=new old2=new2" for bash 3 compatibility (macOS).
+RENAME_PAIRS=""
+
+if [ -z "$RENAMES" ]; then
+  # Load saved renames from previous setup
+  if [ -f "$HOME/.nanostack/setup.json" ]; then
+    saved_renames=$(jq -r '.renames // {} | to_entries[] | "\(.key)=\(.value)"' "$HOME/.nanostack/setup.json" 2>/dev/null | tr '\n' ',')
+    RENAMES="${saved_renames%,}"
+    validate_renames "$HOME/.nanostack/setup.json"
+  fi
+else
+  # Passed via --rename on the command line.
+  validate_renames "--rename flag"
+fi
+
+if [ -n "$RENAMES" ]; then
+  RENAME_PAIRS=$(echo "$RENAMES" | tr ',' ' ')
+fi
+
+# Get the public name for a skill (after renames)
+skill_public_name() {
+  local skill="$1"
+  for pair in $RENAME_PAIRS; do
+    local old="${pair%%=*}"
+    local new="${pair#*=}"
+    if [ "$old" = "$skill" ]; then
+      echo "$new"
+      return
+    fi
+  done
+  echo "$skill"
+}
+
+# Install a renamed skill: copy SKILL.md with updated name in frontmatter
+install_renamed_skill() {
+  local skill="$1"
+  local public_name="$2"
+  local target_dir="$3"
+  local dir
+  dir=$(skill_dir "$skill")
+
+  # Defense in depth: callers already validate but this function is exposed
+  # as an API for future callers, so re-check.
+  if ! is_valid_skill_name "$skill" || ! is_valid_skill_name "$public_name"; then
+    echo "ERROR: install_renamed_skill refused '$skill' -> '$public_name'" >&2
+    return 1
+  fi
+
+  mkdir -p "$target_dir/$public_name"
+
+  # Use sed with a controlled delimiter. public_name has already been
+  # constrained to [a-z0-9-] so it cannot inject sed metacharacters, but
+  # the explicit delimiter keeps this robust if the regex is ever loosened.
+  sed "s|^name: .*|name: $public_name|" "$SOURCE_DIR/$dir/SKILL.md" > "$target_dir/$public_name/SKILL.md"
+
+  # Symlink everything else (references, templates, bin, etc.)
+  for item in "$SOURCE_DIR/$dir"/*; do
+    local basename
+    basename=$(basename "$item")
+    [ "$basename" = "SKILL.md" ] && continue
+    ln -snf "$item" "$target_dir/$public_name/$basename" 2>/dev/null || true
+  done
+}
+
+# Return 0 if $1 resolves to a path under $2 (after following symlinks
+# and normalising .. / .), 1 otherwise. Used as a guard before rm -rf
+# on any path derived from user input. realpath is GNU/BSD-portable
+# enough for the platforms nanostack targets; when it is missing the
+# guard refuses rather than fall back to the unresolved path.
+path_is_under() {
+  local target="$1" root="$2"
+  [ -n "$target" ] && [ -n "$root" ] || return 1
+  local real_target real_root
+  if ! real_target=$(cd "$(dirname "$target")" 2>/dev/null && pwd -P)/$(basename "$target"); then
+    return 1
+  fi
+  if ! real_root=$(cd "$root" 2>/dev/null && pwd -P); then
+    return 1
+  fi
+  case "$real_target" in
+    "$real_root"|"$real_root"/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# ─── Auto-detect agents ──────────────────────────────────────
+INSTALL_CLAUDE=0
+INSTALL_CODEX=0
+INSTALL_CURSOR=0
+INSTALL_OPENCODE=0
+INSTALL_GEMINI=0
+
+if [ "$HOST" = "auto" ]; then
+  command -v claude >/dev/null 2>&1 && INSTALL_CLAUDE=1
+  command -v codex >/dev/null 2>&1 && INSTALL_CODEX=1
+  command -v cursor >/dev/null 2>&1 && INSTALL_CURSOR=1
+  command -v opencode >/dev/null 2>&1 && INSTALL_OPENCODE=1
+  command -v gemini >/dev/null 2>&1 && INSTALL_GEMINI=1
+  # Default to claude if nothing detected
+  TOTAL=$((INSTALL_CLAUDE + INSTALL_CODEX + INSTALL_CURSOR + INSTALL_OPENCODE + INSTALL_GEMINI))
+  [ "$TOTAL" -eq 0 ] && INSTALL_CLAUDE=1
+elif [ "$HOST" = "claude" ]; then
+  INSTALL_CLAUDE=1
+elif [ "$HOST" = "codex" ]; then
+  INSTALL_CODEX=1
+elif [ "$HOST" = "cursor" ]; then
+  INSTALL_CURSOR=1
+elif [ "$HOST" = "opencode" ]; then
+  INSTALL_OPENCODE=1
+elif [ "$HOST" = "gemini" ]; then
+  INSTALL_GEMINI=1
+fi
+
+# ─── Claude Code ──────────────────────────────────────────────
+# Creates symlinks from ~/.claude/skills/<skill> → nanostack/<skill>
+# so Claude Code discovers each skill as a top-level slash command.
+install_claude() {
+  local skills_dir="$1"
+  local linked=()
+  local renamed=()
+
+  # Check we're inside a skills directory
+  local basename
+  basename="$(basename "$skills_dir")"
+  if [ "$basename" != "skills" ]; then
+    echo "  (skipped skill symlinks — not inside a skills/ directory)"
+    echo "  Recommended: git clone into ~/.claude/skills/nanostack"
+    return
+  fi
+
+  for skill in "${SKILLS[@]}"; do
+    local public_name
+    public_name=$(skill_public_name "$skill")
+    local dir
+    dir=$(skill_dir "$skill")
+
+    # Clean up: remove old symlink with the original name if we're renaming
+    if [ "$public_name" != "$skill" ]; then
+      [ -L "$skills_dir/$skill" ] && rm -f "$skills_dir/$skill"
+    fi
+
+    local target="$skills_dir/$public_name"
+
+    # Refuse to touch any path that does not resolve inside skills_dir.
+    # The rename map is already validated on entry, but this is the last
+    # chance before a rm -rf; treat it as an invariant and abort cleanly.
+    if ! path_is_under "$target" "$skills_dir"; then
+      echo "ERROR: target '$target' escapes skills directory '$skills_dir'; refusing to modify" >&2
+      continue
+    fi
+
+    # Always remove stale symlink/dir at target to recreate cleanly
+    [ -L "$target" ] && rm -f "$target"
+    [ -d "$target" ] && [ ! -L "$target" ] && rm -rf "$target"
+
+    if [ "$public_name" != "$skill" ]; then
+      # Renamed: copy SKILL.md with new name, symlink the rest
+      install_renamed_skill "$skill" "$public_name" "$skills_dir"
+      renamed+=("/$skill > /$public_name")
+    else
+      # Normal: symlink the directory
+      ln -snf "nanostack/$dir" "$target"
+      linked+=("$skill")
+    fi
+  done
+
+  if [ ${#linked[@]} -gt 0 ]; then
+    echo "  Linked skills: ${linked[*]}"
+  fi
+  if [ ${#renamed[@]} -gt 0 ]; then
+    echo "  Renamed skills: ${renamed[*]}"
+  fi
+
+  # Install commands to ~/.claude/commands/ (or .claude/commands/ for local)
+  local commands_dir
+  if [ "$LOCAL_INSTALL" -eq 1 ]; then
+    commands_dir="$(dirname "$skills_dir")/commands"
+  else
+    commands_dir="$HOME/.claude/commands"
+  fi
+  mkdir -p "$commands_dir"
+
+  local cmds=()
+  for cmd in "$SOURCE_DIR/commands"/*.md; do
+    [ -f "$cmd" ] || continue
+    local cmd_name
+    cmd_name=$(basename "$cmd")
+    ln -snf "$cmd" "$commands_dir/$cmd_name"
+    cmds+=("/${cmd_name%.md}")
+  done
+  if [ ${#cmds[@]} -gt 0 ]; then
+    echo "  Linked commands: ${cmds[*]}"
+  fi
+}
+
+# ─── OpenAI Codex ─────────────────────────────────────────────
+# Creates nanostack-<skill> directories with symlinks in ~/.codex/skills/
+install_codex() {
+  local codex_skills="${HOME}/.codex/skills"
+  mkdir -p "$codex_skills"
+
+  # Create runtime root with symlinks to source
+  local codex_root="$codex_skills/nanostack"
+  mkdir -p "$codex_root"
+  ln -snf "$SOURCE_DIR/SKILL.md" "$codex_root/SKILL.md"
+  ln -snf "$SOURCE_DIR/AGENTS.md" "$codex_root/AGENTS.md"
+
+  local linked=()
+  for skill in "${SKILLS[@]}"; do
+    local dir
+    dir=$(skill_dir "$skill")
+    local target="$codex_skills/nanostack-${skill}"
+    if [ -L "$target" ] || [ ! -e "$target" ]; then
+      ln -snf "$SOURCE_DIR/$dir" "$target"
+      linked+=("nanostack-${skill}")
+    fi
+  done
+
+  if [ ${#linked[@]} -gt 0 ]; then
+    echo "  Linked skills: ${linked[*]}"
+  fi
+}
+
+# ─── Cursor ───────────────────────────────────────────────────
+# Creates .cursor/rules/ with skill references
+install_cursor() {
+  local cursor_rules=".cursor/rules"
+  mkdir -p "$cursor_rules"
+
+  # Create a rule that loads nanostack skills
+  cat > "$cursor_rules/nanostack.md" << CURSORRULE
+---
+description: "Nanostack engineering workflow skills"
+alwaysApply: true
+---
+
+You have access to nanostack skills. Read SKILL.md files in $SOURCE_DIR for instructions.
+
+Available: /think, /nano, /review, /qa, /security, /ship, /guard, /conductor, /compound, /feature, /nano-run, /nano-help
+Workflow: /think → /nano → build → /review → /security → /qa → /ship
+Shortcuts: /think --autopilot (full sprint), /feature <description> (add to existing project)
+Start: /nano-run (first-time setup)
+CURSORRULE
+
+  echo "  Created $cursor_rules/nanostack.md"
+}
+
+# ─── OpenCode ─────────────────────────────────────────────────
+# Symlinks into ~/.agents/skills/ (OpenCode scans this natively)
+install_opencode() {
+  local agents_skills="${HOME}/.agents/skills"
+  mkdir -p "$agents_skills"
+
+  local agents_root="$agents_skills/nanostack"
+  if [ -L "$agents_root" ] || [ ! -e "$agents_root" ]; then
+    ln -snf "$SOURCE_DIR" "$agents_root"
+    echo "  Linked $agents_root → $SOURCE_DIR"
+  fi
+}
+
+# ─── Gemini CLI ───────────────────────────────────────────────
+# Installs as Gemini extension
+install_gemini() {
+  # Try to install the extension automatically
+  if gemini extensions install "https://github.com/garagon/nanostack.git" --consent 2>/dev/null; then
+    echo "  Gemini extension installed."
+  elif gemini extensions link "$SOURCE_DIR" 2>/dev/null; then
+    echo "  Gemini extension linked (development mode)."
+  else
+    echo "  Gemini CLI: run 'gemini extensions install https://github.com/garagon/nanostack --consent'"
+  fi
+}
+
+# ─── Config ──────────────────────────────────────────────────
+# Persist installation metadata to ~/.nanostack/setup.json
+write_setup_config() {
+  local config_dir="$HOME/.nanostack"
+  mkdir -p "$config_dir"
+
+  local agents="[]"
+  [ "$INSTALL_CLAUDE" -eq 1 ] && agents=$(echo "$agents" | jq '. + ["claude"]')
+  [ "$INSTALL_CODEX" -eq 1 ] && agents=$(echo "$agents" | jq '. + ["codex"]')
+  [ "$INSTALL_CURSOR" -eq 1 ] && agents=$(echo "$agents" | jq '. + ["cursor"]')
+  [ "$INSTALL_OPENCODE" -eq 1 ] && agents=$(echo "$agents" | jq '. + ["opencode"]')
+  [ "$INSTALL_GEMINI" -eq 1 ] && agents=$(echo "$agents" | jq '. + ["gemini"]')
+
+  # Build renames JSON object
+  local renames_json="{}"
+  for pair in $RENAME_PAIRS; do
+    local old="${pair%%=*}"
+    local new="${pair#*=}"
+    renames_json=$(echo "$renames_json" | jq --arg k "$old" --arg v "$new" '. + {($k): $v}')
+  done
+
+  jq -n \
+    --arg src "$SOURCE_DIR" \
+    --arg ver "$(git -C "$SOURCE_DIR" describe --tags 2>/dev/null || git -C "$SOURCE_DIR" rev-parse --short HEAD 2>/dev/null || echo 'unknown')" \
+    --argjson agents "$agents" \
+    --argjson local "$LOCAL_INSTALL" \
+    --argjson renames "$renames_json" \
+    --arg date "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+    '{
+      schema_version: "1",
+      source: $src,
+      version: $ver,
+      agents: $agents,
+      local_install: ($local == 1),
+      renames: $renames,
+      installed_at: $date
+    }' > "$config_dir/setup.json"
+}
+
+# ─── Execute ──────────────────────────────────────────────────
+echo "Nanostack Setup"
+echo "================"
+echo ""
+
+if [ "$INSTALL_CLAUDE" -eq 1 ]; then
+  install_claude "$SKILLS_DIR"
+  if [ "$LOCAL_INSTALL" -eq 1 ]; then
+    echo "nanostack ready (claude, project-local)."
+  else
+    echo "nanostack ready (claude)."
+  fi
+  echo "  skills: $SKILLS_DIR"
+fi
+
+if [ "$INSTALL_CODEX" -eq 1 ]; then
+  install_codex
+  echo "nanostack ready (codex)."
+  echo "  skills: ${HOME}/.codex/skills"
+fi
+
+if [ "$INSTALL_CURSOR" -eq 1 ]; then
+  install_cursor
+  echo "nanostack ready (cursor)."
+fi
+
+if [ "$INSTALL_OPENCODE" -eq 1 ]; then
+  install_opencode
+  echo "nanostack ready (opencode)."
+  echo "  skills: ${HOME}/.agents/skills/nanostack"
+fi
+
+if [ "$INSTALL_GEMINI" -eq 1 ]; then
+  install_gemini
+  echo "nanostack ready (gemini)."
+fi
+
+# Save installation config
+write_setup_config
+echo ""
+echo "  config: ~/.nanostack/setup.json"
+
+# ─── Per-host protection level summary ──────────────────────
+# Read each installed host's adapter file and report the declared
+# capability in user-facing wording. The adapter is the source of
+# truth for what nanostack actually enforces on that host. Honest
+# summary instead of a uniform "ready" line that would mask the
+# Claude vs everyone-else gap.
+
+_proto_label() {
+  case "$1" in
+    enforced)          echo "full guard support (commands and writes blocked when unsafe)" ;;
+    hooked)            echo "hooked, blocking depends on host" ;;
+    detectable)        echo "detectable issues only" ;;
+    instructions_only) echo "guided workflow only (no automatic blocking)" ;;
+    unsupported)       echo "no nanostack support" ;;
+    *)                 echo "$1" ;;
+  esac
+}
+
+_print_protection_for() {
+  local host="$1" pretty="$2"
+  local adapter="$SOURCE_DIR/adapters/$host.json"
+  if [ ! -f "$adapter" ]; then
+    echo "  $pretty: adapter file missing (reinstall recommended)"
+    return
+  fi
+  local bash_cap write_cap
+  bash_cap=$(jq -r '.bash_guard'  "$adapter" 2>/dev/null)
+  write_cap=$(jq -r '.write_guard' "$adapter" 2>/dev/null)
+  if [ "$bash_cap" = "$write_cap" ]; then
+    echo "  $pretty: $(_proto_label "$bash_cap")"
+  else
+    echo "  $pretty: bash $(_proto_label "$bash_cap"); write $(_proto_label "$write_cap")"
+  fi
+}
+
+echo ""
+echo "Protection level:"
+[ "$INSTALL_CLAUDE" -eq 1 ]   && _print_protection_for "claude"   "Claude Code"
+[ "$INSTALL_CODEX" -eq 1 ]    && _print_protection_for "codex"    "Codex"
+[ "$INSTALL_CURSOR" -eq 1 ]   && _print_protection_for "cursor"   "Cursor"
+[ "$INSTALL_OPENCODE" -eq 1 ] && _print_protection_for "opencode" "OpenCode"
+[ "$INSTALL_GEMINI" -eq 1 ]   && _print_protection_for "gemini"   "Gemini CLI"
+
+# ─── Per-agent activation guidance ───────────────────────────
+# Tell the user how to actually see the skills in the agents they installed
+# for. Cursor and Codex need a restart that the install step does not perform.
+echo ""
+echo "Next step:"
+[ "$INSTALL_CLAUDE" -eq 1 ]   && echo "  Claude Code:  ready now. Type /nano-help to see all commands."
+[ "$INSTALL_CURSOR" -eq 1 ]   && echo "  Cursor:       restart Cursor (close and reopen), then type /nano-help."
+[ "$INSTALL_CODEX" -eq 1 ]    && echo "  Codex:        run \`codex\` in a new terminal, then type /nano-help."
+[ "$INSTALL_OPENCODE" -eq 1 ] && echo "  OpenCode:     restart your OpenCode session, then type /nano-help."
+[ "$INSTALL_GEMINI" -eq 1 ]   && echo "  Gemini CLI:   run \`gemini\` in a new terminal, then type /nano-help."
+
+echo ""
+echo "Per-project setup (run once in each project):"
+echo "  ~/.claude/skills/nanostack/bin/init-project.sh"
+echo ""
+echo "Update: ~/.claude/skills/nanostack/bin/upgrade.sh"
+
+# ─── Verbose: full skill list and workflow line ──────────────
+# Default output stays tight so non-technical users are not greeted
+# with a wall of slash commands. Pass --verbose (or -v) to see the
+# legacy listing.
+if [ "$VERBOSE" -eq 1 ]; then
+  echo ""
+  echo "Available skills:"
+  for skill in "${SKILLS[@]}"; do
+    pname=$(skill_public_name "$skill")
+    if [ "$pname" != "$skill" ]; then
+      echo "  /$pname (renamed from /$skill)"
+    else
+      echo "  /$skill"
+    fi
+  done
+  echo ""
+  w_think=$(skill_public_name "think")
+  w_nano=$(skill_public_name "nano")
+  w_review=$(skill_public_name "review")
+  w_qa=$(skill_public_name "qa")
+  w_security=$(skill_public_name "security")
+  w_ship=$(skill_public_name "ship")
+  w_guard=$(skill_public_name "guard")
+  echo "Workflow: /$w_think → /$w_nano → build → /$w_review → /$w_security → /$w_qa → /$w_ship"
+  echo "Safety:   /$w_guard (activate on-demand)"
+  echo "Start:    /nano-run (first-time setup)"
+fi
+
+# Explicit success: previous `[ test ] && echo` lines return 1 for any
+# agent the user did NOT install, which would leak into upgrade.sh and
+# CI runs under `set -e`. End with exit 0.
+exit 0

@@ -1,0 +1,15 @@
+{
+  "host": "codex",
+  "schema_version": "1",
+  "last_verified": "2026-09-10",
+  "verification": {
+    "method": "manual",
+    "evidence": "setup install_codex symlinks skill directories under ~/.codex/skills/nanostack-<skill> but does not register any pre-action hook. On 2026-09-10, setup --host codex completed in an isolated Linux container and installed SKILL.md targets were readable. Installation smoke only; no model-driven Codex sprint was exercised."
+  },
+  "skill_discovery": "native",
+  "bash_guard": "instructions_only",
+  "write_guard": "instructions_only",
+  "phase_gate": "instructions_only",
+  "install_target": "~/.codex/skills/nanostack",
+  "doctor_checks": ["commands"]
+}

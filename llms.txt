@@ -1,0 +1,61 @@
+# Nanostack
+
+Nanostack is a local workflow framework for AI coding agents. It ships the default sprint (think -> plan -> build -> review -> security -> qa -> ship -> compound) plus a framework for declaring your own custom workflow stacks. Each phase is a skill that the agent reads from disk; downstream skills cross-reference each other through structured artifacts in `.nanostack/`.
+
+## Verified adapters
+
+These hosts have a tested adapter in `adapters/` with documented capability evidence. The `adapters/<host>.json` files are the single source of truth.
+
+- Claude Code
+- Cursor
+- OpenAI Codex
+- OpenCode
+- Gemini CLI
+
+Other agents may read the SKILL.md files directly, but are not verified adapters unless they appear in this list. Capabilities (hook enforcement, write guard, phase gate) vary by host; the JSON files spell out what each adapter actually enforces.
+
+## Default sprint
+
+- /think: Refines a rough idea before any code is written: questions one at a time, 2-3 alternative approaches with trade-offs, design walked in sections. Calibrates intensity per archetype (founder validation, CLI tooling, API backend, landing experience). Saves a structured artifact with value proposition, scope mode, target user, narrowest wedge, key risk, and premise validation.
+- /nano (alias /plan): Implementation plan with planned_files, plan approval, scope assessment, and product standards.
+- build: The agent's own dev work. Not a saved phase; the artifact appears on review.
+- /review: Two-pass code review (structural + adversarial). Detects scope drift against the plan and conflict-precedence against prior /security.
+- /security: OWASP Top 10 + STRIDE audit, stack-aware. Cross-references /review for conflict resolution.
+- /qa: Browser, API, CLI, or debug testing. WTF heuristic to stop when further fixes regress.
+- /ship: Pre-flight, PR creation, CI monitoring, post-deploy verification. Generates the sprint journal.
+- /compound: Reflection and learning capture after /ship.
+
+## Framework for custom workflow stacks
+
+Custom stacks declare their own phases in `.nanostack/config.json` (`custom_phases` + `phase_graph`) and live under `<store>/skills/<name>/`. The conductor, guard, session, next-step, and resolver all consume the same phase registry, so a custom stack such as `build -> license-audit -> privacy-check -> release-readiness -> ship` gets the same lifecycle support as the built-in sprint: graph-aware progression, concurrency enforcement, artifact trust, schema validation, and routing intent through `phase_context`.
+
+See `reference/custom-stack-contract.md` for the contract, `examples/custom-stack-template/compliance-release/` for a worked example, and `EXTENDING.md` for the new-user walkthrough.
+
+## Guard
+
+`guard/` enforces block rules and warn rules on Bash and Write/Edit calls. Rules live in `guard/rules.json` and are loaded at runtime; counts are not hand-maintained in docs. Block rules run before the allowlist so commands whose binary is allowlisted (cat, find, head, tail) still hit pattern checks for known-bad arguments. Phase concurrency, the sprint phase gate, and the budget gate run inside the same check pipeline.
+
+## Artifacts and trust
+
+Every artifact written by `bin/save-artifact.sh` carries a SHA-256 integrity field. `bin/find-artifact.sh` has a `--require-integrity` flag for strict consumers, and `bin/resolve.sh` exposes per-upstream trust state in its `upstream_status` field (`verified`, `integrity_missing`, `integrity_mismatch`, `missing`, `not_applicable`).
+
+## Visual artifacts
+
+`bin/render-artifact.sh` renders core and registered custom phase artifacts, sprint journals, and custom stack DAGs as local HTML views. Output lands under `.nanostack/visual/` with a companion manifest recording the source artifact path, integrity, and renderer version. HTML is a derived, deletable view; JSON remains canonical. The renderer is offline (Content-Security-Policy locks every page, no external scripts or fonts). A `--strict` flag fails the render when any source has `integrity_missing` or `integrity_mismatch`. An `--interactive` flag adds copy-only clipboard buttons to `/plan` and `/review` (copy as prompt / Markdown / JSON patch); no filesystem writes, no network calls. The contract is in `reference/visual-artifact-contract.md`.
+
+## Privacy
+
+There is no Nanostack cloud. Artifacts, journals, and analytics stay under `.nanostack/` on disk. Telemetry is opt-in and documented in `TELEMETRY.md`; the on-by-default behavior is no remote calls.
+
+## Install
+
+```
+git clone https://github.com/garagon/nanostack.git ~/.claude/skills/nanostack
+cd ~/.claude/skills/nanostack && ./setup
+```
+
+## Links
+
+- Repository: https://github.com/garagon/nanostack
+- License: Apache 2.0
+- Inspired by: https://github.com/garrytan/gstack
